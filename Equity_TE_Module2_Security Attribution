@@ -1,0 +1,799 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Feb 25 19:08:21 2026
+
+@author: amits
+"""
+
+# -*- coding: utf-8 -*-
+"""
+===============================================================================
+EQUITY TE ATTRIBUTION — MODULE 2: FACTOR-BASED TRACKING ERROR DECOMPOSITION
+===============================================================================
+
+Reads Module 1 output (prices, weights, factor returns, fundamentals).
+Runs time-series factor regressions for each security.
+Decomposes tracking error into factor + idiosyncratic contributions.
+
+8-step pipeline:
+  1. Load data from Module 1 output
+  2. Compute monthly stock returns
+  3. Compute active weights (portfolio − benchmark)
+  4. Time-series regressions: excess return ~ 7 factors
+  5. Active factor exposures
+  6. Factor covariance matrix (with optional exponential weighting)
+  7. Idiosyncratic (specific) risk
+  8. Total TE calculation and factor decomposition
+
+Install: pip install pandas numpy openpyxl scipy statsmodels
+===============================================================================
+"""
+
+import pandas as pd
+import numpy as np
+from scipy import stats
+import statsmodels.api as sm
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# CONFIGURATION — UPDATE PATHS BEFORE RUNNING
+# =============================================================================
+
+# Module 1 output file (contains all 8 sheets)
+MODULE1_FILE = Equity_Prices, Fundamentals ,Factor returns.xlsx"
+
+
+# Alternatively, if prices & fundamentals are in separate file:
+# PRICE_FILE = Monthly_and_daily_ticker_data.xlsx"
+# HOLDINGS_FILE = Portfolio holdings.xlsx"
+
+# Factor names (must match Module 1 Factor_Returns sheet columns)
+FACTOR_NAMES = ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA', 'Mom', 'Vol']
+RF_COLUMN = 'RF'
+
+# Vol factor ETFs (excluded from security universe)
+ETF_TICKERS = ['SPLV', 'SPY']
+
+# Covariance estimation
+USE_EXPONENTIAL_WEIGHTING = False   # True = EWMA, False = equal-weight
+EWMA_HALFLIFE = 36                  # months (3 years) — only if EWMA enabled
+
+# Minimum observations for regression
+MIN_REGRESSION_OBS = 36             # at least 3 years of monthly data
+
+# Annualization
+ANNUALIZATION_FACTOR = 12           # monthly → annual
+
+# Output
+OUTPUT_FILE = "Equity_TE_Attribution.xlsx"
+
+
+# =============================================================================
+# STEP 1: LOAD DATA FROM MODULE 1
+# =============================================================================
+
+def load_module1_data(filepath):
+    """Load all sheets from Module 1 output."""
+    print("\n" + "=" * 70)
+    print("EQUITY TE — MODULE 2: FACTOR-BASED TE DECOMPOSITION")
+    print("=" * 70)
+    print(f"\n[1/8] Loading Module 1 data from: {filepath}")
+
+    monthly_prices = pd.read_excel(filepath, sheet_name='Monthly_Prices',
+                                   index_col=0, parse_dates=True)
+    monthly_prices.sort_index(inplace=True)
+
+    port_weights = pd.read_excel(filepath, sheet_name='Portfolio_Weights')
+    port_weights = port_weights.set_index('Ticker')['Weight']
+
+    bench_weights = pd.read_excel(filepath, sheet_name='Benchmark_Weights')
+    bench_weights = bench_weights.set_index('Ticker')['Weight']
+
+    factor_returns = pd.read_excel(filepath, sheet_name='Factor_Returns',
+                                   index_col=0, parse_dates=True)
+    factor_returns.sort_index(inplace=True)
+
+    # Load fundamentals for cross-check (not used in regressions)
+    try:
+        fundamentals = pd.read_excel(filepath, sheet_name='Fundamentals',
+                                     index_col=0)
+    except Exception:
+        fundamentals = pd.DataFrame()
+
+    # Security universe = all tickers in portfolio or benchmark, excluding ETFs
+    universe = sorted(set(port_weights.index.tolist() +
+                          bench_weights.index.tolist()))
+    universe = [t for t in universe if t not in ETF_TICKERS]
+
+    print(f"      Portfolio:   {len(port_weights)} tickers, "
+          f"sum = {port_weights.sum():.4f}")
+    print(f"      Benchmark:   {len(bench_weights)} tickers, "
+          f"sum = {bench_weights.sum():.4f}")
+    print(f"      Universe:    {len(universe)} securities")
+    print(f"      Monthly:     {monthly_prices.shape[1]} tickers × "
+          f"{monthly_prices.shape[0]} months")
+    print(f"      Factors:     {[c for c in factor_returns.columns if c != RF_COLUMN]}")
+    print(f"      Factor obs:  {len(factor_returns)}")
+
+    return (monthly_prices, port_weights, bench_weights,
+            factor_returns, fundamentals, universe)
+
+
+# =============================================================================
+# STEP 2: COMPUTE MONTHLY STOCK RETURNS
+# =============================================================================
+
+def compute_stock_returns(monthly_prices, universe):
+    """Convert monthly prices to monthly returns for universe securities."""
+    print(f"\n[2/8] Computing monthly stock returns...")
+
+    # Filter to securities in universe that have price data
+    available = [t for t in universe if t in monthly_prices.columns]
+    missing = [t for t in universe if t not in monthly_prices.columns]
+
+    if missing:
+        print(f"      WARNING: {len(missing)} tickers missing from price data: "
+              f"{missing}")
+
+    stock_returns = monthly_prices[available].pct_change().dropna(how='all')
+
+    print(f"      Returns computed: {stock_returns.shape[1]} securities × "
+          f"{stock_returns.shape[0]} months")
+    print(f"      Date range: {stock_returns.index[0].strftime('%Y-%m')} to "
+          f"{stock_returns.index[-1].strftime('%Y-%m')}")
+
+    return stock_returns, available
+
+
+# =============================================================================
+# STEP 3: COMPUTE ACTIVE WEIGHTS
+# =============================================================================
+
+def compute_active_weights(port_weights, bench_weights, universe):
+    """
+    Active weight h_i = portfolio weight − benchmark weight.
+    Securities only in portfolio → positive h (overweight).
+    Securities only in benchmark → negative h (underweight).
+    """
+    print(f"\n[3/8] Computing active weights...")
+
+    h = pd.Series(0.0, index=universe, name='Active_Weight')
+
+    for ticker in universe:
+        pw = port_weights.get(ticker, 0.0)
+        bw = bench_weights.get(ticker, 0.0)
+        h[ticker] = pw - bw
+
+    # Diagnostics
+    overweight = h[h > 0]
+    underweight = h[h < 0]
+    zero_weight = h[h == 0]
+
+    print(f"      Overweight:  {len(overweight)} securities "
+          f"(sum = {overweight.sum():+.4f})")
+    print(f"      Underweight: {len(underweight)} securities "
+          f"(sum = {underweight.sum():+.4f})")
+    print(f"      Neutral:     {len(zero_weight)} securities")
+    print(f"      Net active:  {h.sum():+.6f} "
+          f"(should be ~0 if weights sum to 1)")
+
+    # Top 5 active bets
+    print(f"\n      Top 5 overweights:")
+    for ticker, w in overweight.nlargest(5).items():
+        print(f"        {ticker:<8s} {w:+.4f}")
+    print(f"      Top 5 underweights:")
+    for ticker, w in underweight.nsmallest(5).items():
+        print(f"        {ticker:<8s} {w:+.4f}")
+
+    return h
+
+
+# =============================================================================
+# STEP 4: TIME-SERIES FACTOR REGRESSIONS
+# =============================================================================
+
+def run_factor_regressions(stock_returns, factor_returns, available_tickers):
+    """
+    For each security, regress excess return on 7 factors:
+      (R_i - RF) = α_i + β_i1*(Mkt-RF) + β_i2*SMB + ... + β_i7*Vol + ε_i
+
+    Returns:
+      beta_matrix:   DataFrame (securities × factors) of factor betas
+      alpha_series:  Series of regression alphas
+      resid_var:     Series of residual (idiosyncratic) variances (monthly)
+      r_squared:     Series of R² values
+      reg_stats:     DataFrame of full regression diagnostics
+    """
+    print(f"\n[4/8] Running time-series factor regressions...")
+    print(f"      Model: (R_i - RF) ~ {' + '.join(FACTOR_NAMES)}")
+    print(f"      Min observations: {MIN_REGRESSION_OBS}")
+
+    # Align dates between stock returns and factor returns
+    common_dates = stock_returns.index.intersection(factor_returns.index)
+    stock_ret_aligned = stock_returns.loc[common_dates]
+    factors_aligned = factor_returns.loc[common_dates]
+
+    print(f"      Common dates: {len(common_dates)} months "
+          f"({common_dates[0].strftime('%Y-%m')} to "
+          f"{common_dates[-1].strftime('%Y-%m')})")
+
+    # Extract RF and factor matrix
+    rf = factors_aligned[RF_COLUMN] if RF_COLUMN in factors_aligned.columns \
+        else pd.Series(0.0, index=common_dates)
+
+    # Verify all factor columns exist
+    available_factors = [f for f in FACTOR_NAMES if f in factors_aligned.columns]
+    missing_factors = [f for f in FACTOR_NAMES if f not in factors_aligned.columns]
+    if missing_factors:
+        print(f"      WARNING: Missing factors: {missing_factors}")
+    print(f"      Using factors: {available_factors}")
+
+    X = factors_aligned[available_factors]
+
+    # Results storage
+    beta_dict = {}
+    alpha_dict = {}
+    resid_var_dict = {}
+    r2_dict = {}
+    nobs_dict = {}
+    tstat_dict = {}
+    skipped = []
+
+    for ticker in available_tickers:
+        # Excess return
+        y = stock_ret_aligned[ticker] - rf
+
+        # Drop NaN observations
+        valid = y.dropna().index.intersection(X.dropna(how='any').index)
+
+        if len(valid) < MIN_REGRESSION_OBS:
+            skipped.append((ticker, len(valid)))
+            continue
+
+        y_clean = y.loc[valid]
+        X_clean = X.loc[valid]
+
+        # OLS regression with constant (alpha)
+        X_const = sm.add_constant(X_clean)
+        model = sm.OLS(y_clean, X_const).fit()
+
+        # Store results
+        betas = model.params.drop('const')
+        beta_dict[ticker] = betas
+        alpha_dict[ticker] = model.params['const']
+        resid_var_dict[ticker] = model.mse_resid  # σ²_ε (monthly)
+        r2_dict[ticker] = model.rsquared_adj
+        nobs_dict[ticker] = model.nobs
+        tstat_dict[ticker] = model.tvalues.drop('const')
+
+    # Build output DataFrames
+    beta_matrix = pd.DataFrame(beta_dict).T
+    beta_matrix.index.name = 'Ticker'
+
+    alpha_series = pd.Series(alpha_dict, name='Alpha')
+    resid_var = pd.Series(resid_var_dict, name='Residual_Var_Monthly')
+    r_squared = pd.Series(r2_dict, name='Adj_R2')
+    nobs = pd.Series(nobs_dict, name='N_Obs')
+    tstat_df = pd.DataFrame(tstat_dict).T
+
+    # Regression diagnostics table
+    reg_stats = pd.DataFrame({
+        'Alpha_Monthly': alpha_series,
+        'Alpha_Annual_bps': alpha_series * ANNUALIZATION_FACTOR * 10000,
+        'Adj_R2': r_squared,
+        'N_Obs': nobs,
+        'Resid_Vol_Monthly': np.sqrt(resid_var),
+        'Resid_Vol_Annual': np.sqrt(resid_var * ANNUALIZATION_FACTOR),
+    })
+
+    # Add betas to stats
+    for factor in available_factors:
+        reg_stats[f'Beta_{factor}'] = beta_matrix[factor]
+        reg_stats[f'tstat_{factor}'] = tstat_df[factor]
+
+    print(f"\n      Regressions completed: {len(beta_matrix)}/{len(available_tickers)}")
+    if skipped:
+        print(f"      Skipped ({len(skipped)} insufficient data):")
+        for t, n in skipped:
+            print(f"        {t}: {n} obs (need {MIN_REGRESSION_OBS})")
+
+    print(f"\n      Adj R² summary:")
+    print(f"        Mean:   {r_squared.mean():.3f}")
+    print(f"        Median: {r_squared.median():.3f}")
+    print(f"        Min:    {r_squared.min():.3f} ({r_squared.idxmin()})")
+    print(f"        Max:    {r_squared.max():.3f} ({r_squared.idxmax()})")
+
+    return beta_matrix, alpha_series, resid_var, r_squared, reg_stats
+
+
+# =============================================================================
+# STEP 5: ACTIVE FACTOR EXPOSURES
+# =============================================================================
+
+def compute_active_factor_exposures(beta_matrix, active_weights):
+    """
+    Active factor exposure per factor:
+      f_j = Σ(h_i × β_ij) for each factor j
+
+    This measures the portfolio's active tilt toward each factor.
+    """
+    print(f"\n[5/8] Computing active factor exposures...")
+
+    # Align tickers
+    common_tickers = beta_matrix.index.intersection(active_weights.index)
+    h = active_weights.loc[common_tickers]
+    B = beta_matrix.loc[common_tickers]
+
+    # Active factor exposure = h' × B (vector of length n_factors)
+    active_factor_exp = B.T.dot(h)
+    active_factor_exp.name = 'Active_Factor_Exposure'
+
+    print(f"      Securities used: {len(common_tickers)}")
+    print(f"\n      Active factor exposures:")
+    for factor, exp in active_factor_exp.items():
+        direction = "LONG" if exp > 0 else "SHORT" if exp < 0 else "NEUTRAL"
+        print(f"        {factor:<8s}: {exp:+.4f}  ({direction})")
+
+    return active_factor_exp, common_tickers
+
+
+# =============================================================================
+# STEP 6: FACTOR COVARIANCE MATRIX
+# =============================================================================
+
+def compute_factor_covariance(factor_returns, available_factors):
+    """
+    Compute factor covariance matrix from factor return time series.
+    Optional: exponential weighting (EWMA) for recency bias.
+
+    Returns monthly covariance matrix (annualize later).
+    """
+    print(f"\n[6/8] Estimating factor covariance matrix...")
+
+    F = factor_returns[available_factors].dropna()
+    n_obs = len(F)
+    print(f"      Observations: {n_obs}")
+
+    if USE_EXPONENTIAL_WEIGHTING:
+        print(f"      Method: EWMA (halflife = {EWMA_HALFLIFE} months)")
+        # Exponential weights
+        lam = 1 - np.log(2) / EWMA_HALFLIFE
+        weights = np.array([lam ** (n_obs - 1 - i) for i in range(n_obs)])
+        weights /= weights.sum()
+
+        # Weighted covariance
+        F_centered = F - (F * weights[:, np.newaxis]).sum(axis=0)
+        cov_monthly = (F_centered.T * weights).dot(F_centered)
+    else:
+        print(f"      Method: Equal-weight sample covariance")
+        cov_monthly = F.cov()
+
+    # Diagnostics
+    eigenvalues = np.linalg.eigvalsh(cov_monthly.values)
+    print(f"      Matrix shape: {cov_monthly.shape}")
+    print(f"      Positive definite: {all(eigenvalues > 0)}")
+    print(f"      Condition number: {eigenvalues[-1] / eigenvalues[0]:.1f}")
+
+    print(f"\n      Factor volatilities (annualized):")
+    for factor in available_factors:
+        vol_ann = np.sqrt(cov_monthly.loc[factor, factor] * ANNUALIZATION_FACTOR)
+        print(f"        {factor:<8s}: {vol_ann:.2%}")
+
+    # Correlation matrix for display
+    std = np.sqrt(np.diag(cov_monthly.values))
+    corr = cov_monthly.values / np.outer(std, std)
+    corr_df = pd.DataFrame(corr, index=available_factors, columns=available_factors)
+
+    return cov_monthly, corr_df
+
+
+# =============================================================================
+# STEP 7: IDIOSYNCRATIC (SPECIFIC) RISK
+# =============================================================================
+
+def compute_idiosyncratic_risk(resid_var, active_weights, common_tickers):
+    """
+    Idiosyncratic TE² = Σ(h_i² × σ²_εi)
+    where σ²_εi is the monthly residual variance from the regression.
+    """
+    print(f"\n[7/8] Computing idiosyncratic (specific) risk...")
+
+    h = active_weights.loc[common_tickers]
+    sigma2 = resid_var.loc[common_tickers]
+
+    # Per-security idiosyncratic contribution to TE² (monthly)
+    idio_contrib_monthly = (h ** 2) * sigma2
+    total_idio_var_monthly = idio_contrib_monthly.sum()
+
+    # Annualize
+    total_idio_var_annual = total_idio_var_monthly * ANNUALIZATION_FACTOR
+    total_idio_te = np.sqrt(total_idio_var_annual)
+
+    print(f"      Securities: {len(common_tickers)}")
+    print(f"      Idiosyncratic TE: {total_idio_te:.2%} "
+          f"({total_idio_te * 10000:.1f} bps)")
+
+    # Top contributors
+    idio_contrib_annual = idio_contrib_monthly * ANNUALIZATION_FACTOR
+    top_idio = idio_contrib_annual.nlargest(5)
+    print(f"\n      Top 5 idiosyncratic risk contributors:")
+    for ticker, val in top_idio.items():
+        pct_of_total = val / total_idio_var_annual * 100
+        print(f"        {ticker:<8s}: {np.sqrt(val):.2%} "
+              f"({pct_of_total:.1f}% of idio TE²)")
+
+    return total_idio_var_monthly, idio_contrib_monthly
+
+
+# =============================================================================
+# STEP 7b: SECURITY-LEVEL TE ATTRIBUTION (Marginal TE + Contribution to TE)
+# =============================================================================
+
+def compute_security_attribution(beta_matrix, cov_monthly, resid_var,
+                                 active_weights, common_tickers,
+                                 available_factors):
+    """
+    Decomposes total TE by security (complement to Step 8's factor decomposition).
+
+    Security-level covariance matrix:
+      V = B × Σ_f × B' + D
+      where B = beta matrix, Σ_f = factor cov, D = diagonal idiosyncratic var
+
+    Marginal TE per security:
+      MTE_i = (V × h)_i / total_TE
+      "If I increase active weight in security i by 1 unit, how much does TE change?"
+
+    Contribution to TE per security (Euler decomposition):
+      CTR_i = h_i × MTE_i
+      Sums exactly to total TE.
+
+    Returns:
+      sec_attrib: DataFrame with marginal TE, contribution to TE per security
+      total_te:   scalar total TE (for verification)
+    """
+    print(f"\n[7b/8] Computing security-level TE attribution...")
+
+    # Align everything
+    h = active_weights.loc[common_tickers].values       # n × 1
+    B = beta_matrix.loc[common_tickers, available_factors].values  # n × k
+    Sigma_f = cov_monthly.loc[available_factors, available_factors].values  # k × k
+    sigma2_idio = resid_var.loc[common_tickers].values   # n × 1
+
+    n = len(common_tickers)
+
+    # ---- Build security-level covariance matrix (monthly) ----
+    # V = B × Σ_f × B' + D
+    # Systematic part: n × k  @  k × k  @  k × n  =  n × n
+    V_systematic = B @ Sigma_f @ B.T
+    # Idiosyncratic part: diagonal matrix
+    D = np.diag(sigma2_idio)
+    # Total security covariance (monthly)
+    V = V_systematic + D
+
+    # ---- Total TE² (monthly) ----
+    total_var_monthly = float(h @ V @ h)
+    total_var_annual = total_var_monthly * ANNUALIZATION_FACTOR
+    total_te = np.sqrt(total_var_annual)
+
+    # ---- Marginal TE per security ----
+    # (V × h)_i gives marginal variance contribution per unit of active weight
+    # Divide by total_TE to get marginal TE (annualized)
+    Vh_monthly = V @ h                        # n × 1
+    Vh_annual = Vh_monthly * ANNUALIZATION_FACTOR
+    marginal_te = Vh_annual / total_te         # n × 1
+
+    # ---- Contribution to TE per security (Euler) ----
+    # CTR_i = h_i × MTE_i
+    # These sum exactly to total_te
+    ctr = h * marginal_te                      # n × 1
+
+    # ---- Also split contribution into systematic + idiosyncratic parts ----
+    Vh_sys_monthly = V_systematic @ h
+    Vh_sys_annual = Vh_sys_monthly * ANNUALIZATION_FACTOR
+    ctr_systematic = h * Vh_sys_annual / total_te
+
+    Vh_idio_monthly = D @ h     # = sigma2_idio * h (element-wise since D is diagonal)
+    Vh_idio_annual = Vh_idio_monthly * ANNUALIZATION_FACTOR
+    ctr_idiosyncratic = h * Vh_idio_annual / total_te
+
+    # ---- Build output DataFrame ----
+    sec_attrib = pd.DataFrame({
+        'Ticker': list(common_tickers),
+        'Active_Weight': h,
+        'Marginal_TE': marginal_te,
+        'Marginal_TE_bps': marginal_te * 10000,
+        'Contribution_to_TE': ctr,
+        'Contribution_to_TE_bps': ctr * 10000,
+        'Pct_of_Total_TE': ctr / total_te * 100,
+        'CTR_Systematic_bps': ctr_systematic * 10000,
+        'CTR_Idiosyncratic_bps': ctr_idiosyncratic * 10000,
+    })
+
+    sec_attrib = sec_attrib.sort_values('Contribution_to_TE', ascending=False)
+
+    # ---- Verify sum ----
+    ctr_sum = ctr.sum()
+    print(f"      Securities: {n}")
+    print(f"      Total TE:   {total_te:.2%} ({total_te * 10000:.1f} bps)")
+    print(f"      CTR sum:    {ctr_sum:.2%} ({ctr_sum * 10000:.1f} bps)  "
+          f"[should equal Total TE]")
+    print(f"      Difference: {abs(total_te - ctr_sum) * 10000:.4f} bps  "
+          f"[rounding only]")
+
+    # Top contributors
+    print(f"\n      Top 5 contributors to TE:")
+    print(f"      {'Ticker':<8s} {'Active Wt':>10s} {'Marginal TE':>12s} "
+          f"{'CTR (bps)':>10s} {'% of TE':>8s}")
+    print(f"      {'-'*50}")
+    for _, row in sec_attrib.head(5).iterrows():
+        print(f"      {row['Ticker']:<8s} {row['Active_Weight']:>+10.4f} "
+              f"{row['Marginal_TE_bps']:>12.1f} "
+              f"{row['Contribution_to_TE_bps']:>10.1f} "
+              f"{row['Pct_of_Total_TE']:>7.1f}%")
+
+    print(f"\n      Bottom 5 (reduce TE):")
+    for _, row in sec_attrib.tail(5).iterrows():
+        print(f"      {row['Ticker']:<8s} {row['Active_Weight']:>+10.4f} "
+              f"{row['Marginal_TE_bps']:>12.1f} "
+              f"{row['Contribution_to_TE_bps']:>10.1f} "
+              f"{row['Pct_of_Total_TE']:>7.1f}%")
+
+    return sec_attrib, total_te
+
+
+# =============================================================================
+# STEP 8: TOTAL TE AND FACTOR DECOMPOSITION
+# =============================================================================
+
+def decompose_tracking_error(active_factor_exp, cov_monthly,
+                             total_idio_var_monthly, available_factors):
+    """
+    Total TE² = systematic TE² + idiosyncratic TE²
+    
+    Systematic TE² = f' × Σ_f × f  (where f = active factor exposures)
+    
+    Decomposition by factor:
+      Factor j contribution to TE² = f_j × (Σ_f × f)_j
+      = f_j × Σ_k(Σ_f[j,k] × f_k)
+    
+    This is the Euler/marginal decomposition — contributions sum exactly
+    to systematic TE².
+    """
+    print(f"\n[8/8] Decomposing tracking error by factor...")
+
+    f = active_factor_exp.loc[available_factors]
+    Sigma = cov_monthly.loc[available_factors, available_factors]
+
+    # ---- Systematic TE² (monthly) ----
+    systematic_var_monthly = float(f.values @ Sigma.values @ f.values)
+
+    # ---- Marginal contribution per factor (monthly) ----
+    # MC_j = f_j × (Σ_f × f)_j
+    Sigma_f = Sigma.values @ f.values  # n_factors × 1
+    marginal_contrib_monthly = f.values * Sigma_f  # element-wise
+
+    # ---- Annualize ----
+    systematic_var_annual = systematic_var_monthly * ANNUALIZATION_FACTOR
+    idio_var_annual = total_idio_var_monthly * ANNUALIZATION_FACTOR
+    total_var_annual = systematic_var_annual + idio_var_annual
+
+    total_te = np.sqrt(total_var_annual)
+    systematic_te = np.sqrt(systematic_var_annual)
+    idio_te = np.sqrt(idio_var_annual)
+
+    # Factor contributions (annualized)
+    factor_contrib_annual = marginal_contrib_monthly * ANNUALIZATION_FACTOR
+
+    # Build attribution table
+    attribution = pd.DataFrame({
+        'Factor': available_factors,
+        'Active_Exposure': f.values,
+        'Marginal_Contribution_Var': factor_contrib_annual,
+        'Contribution_bps²': factor_contrib_annual * (10000 ** 2),
+        'Pct_of_Systematic_TE²': factor_contrib_annual / systematic_var_annual * 100
+            if systematic_var_annual > 0 else 0,
+        'Pct_of_Total_TE²': factor_contrib_annual / total_var_annual * 100
+            if total_var_annual > 0 else 0,
+    })
+
+    # Add idiosyncratic row
+    idio_row = pd.DataFrame({
+        'Factor': ['Idiosyncratic'],
+        'Active_Exposure': [np.nan],
+        'Marginal_Contribution_Var': [idio_var_annual],
+        'Contribution_bps²': [idio_var_annual * (10000 ** 2)],
+        'Pct_of_Systematic_TE²': [np.nan],
+        'Pct_of_Total_TE²': [idio_var_annual / total_var_annual * 100
+                              if total_var_annual > 0 else 0],
+    })
+
+    # Add total row
+    total_row = pd.DataFrame({
+        'Factor': ['TOTAL'],
+        'Active_Exposure': [np.nan],
+        'Marginal_Contribution_Var': [total_var_annual],
+        'Contribution_bps²': [total_var_annual * (10000 ** 2)],
+        'Pct_of_Systematic_TE²': [np.nan],
+        'Pct_of_Total_TE²': [100.0],
+    })
+
+    attribution = pd.concat([attribution, idio_row, total_row], ignore_index=True)
+
+    # Add TE contribution column (Euler: variance contribution / total_TE)
+    # This ensures factor + idiosyncratic contributions sum exactly to total_te
+    attribution['Contribution_TE'] = attribution['Marginal_Contribution_Var'] / total_te
+    attribution['Contribution_bps'] = attribution['Contribution_TE'] * 10000
+
+    # ---- Print results ----
+    print(f"\n{'=' * 70}")
+    print("TRACKING ERROR ATTRIBUTION RESULTS")
+    print(f"{'=' * 70}")
+
+    print(f"\n  TOTAL TE:        {total_te:.2%}  ({total_te * 10000:.1f} bps)")
+    print(f"  Systematic TE:   {systematic_te:.2%}  ({systematic_te * 10000:.1f} bps)")
+    print(f"  Idiosyncratic TE:{idio_te:.2%}  ({idio_te * 10000:.1f} bps)")
+    print(f"  Systematic %:    {systematic_var_annual / total_var_annual * 100:.1f}%")
+    print(f"  Idiosyncratic %: {idio_var_annual / total_var_annual * 100:.1f}%")
+
+    print(f"\n  Factor contributions to TE²:")
+    print(f"  {'Factor':<15s} {'Active Exp':>10s} {'TE² Contrib':>12s} "
+          f"{'% of Total':>10s} {'Direction':>10s}")
+    print(f"  {'-'*57}")
+
+    for _, row in attribution.iterrows():
+        if row['Factor'] in ['TOTAL']:
+            print(f"  {'-'*57}")
+        factor = row['Factor']
+        exp = f"{row['Active_Exposure']:+.4f}" if pd.notna(row['Active_Exposure']) else ""
+        var_pct = f"{row['Pct_of_Total_TE²']:.1f}%"
+        var_bps2 = f"{row['Contribution_bps²']:.1f}"
+
+        if row['Factor'] not in ['Idiosyncratic', 'TOTAL']:
+            direction = "↑ adds" if row['Marginal_Contribution_Var'] > 0 else "↓ reduces"
+        else:
+            direction = ""
+
+        print(f"  {factor:<15s} {exp:>10s} {var_bps2:>12s} "
+              f"{var_pct:>10s} {direction:>10s}")
+
+    # Summary dictionary
+    summary = {
+        'Total_TE': total_te,
+        'Total_TE_bps': total_te * 10000,
+        'Systematic_TE': systematic_te,
+        'Systematic_TE_bps': systematic_te * 10000,
+        'Idiosyncratic_TE': idio_te,
+        'Idiosyncratic_TE_bps': idio_te * 10000,
+        'Systematic_Pct': systematic_var_annual / total_var_annual * 100
+            if total_var_annual > 0 else 0,
+        'Idiosyncratic_Pct': idio_var_annual / total_var_annual * 100
+            if total_var_annual > 0 else 0,
+    }
+
+    return attribution, summary
+
+
+# =============================================================================
+# SAVE RESULTS
+# =============================================================================
+
+def save_results(attribution, summary, reg_stats, beta_matrix,
+                 active_weights, active_factor_exp, cov_monthly,
+                 corr_df, idio_contrib_monthly, common_tickers,
+                 sec_attrib):
+    """Save all results to Excel workbook."""
+    print(f"\n\nSaving results to: {OUTPUT_FILE}")
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+
+        # Sheet 1: TE Attribution by Factor (the main result)
+        attribution.to_excel(writer, sheet_name='TE_Attribution_Factor', index=False)
+
+        # Sheet 2: TE Attribution by Security (NEW)
+        sec_attrib.to_excel(writer, sheet_name='TE_Attribution_Security', index=False)
+
+        # Sheet 2: Summary
+        summary_df = pd.DataFrame(
+            list(summary.items()), columns=['Metric', 'Value'])
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+
+        # Sheet 3: Active Weights
+        aw_df = active_weights.reset_index()
+        aw_df.columns = ['Ticker', 'Active_Weight']
+        aw_df = aw_df.sort_values('Active_Weight', ascending=False)
+        aw_df.to_excel(writer, sheet_name='Active_Weights', index=False)
+
+        # Sheet 4: Factor Betas (30 × 7 matrix)
+        beta_matrix.to_excel(writer, sheet_name='Factor_Betas')
+
+        # Sheet 5: Regression Diagnostics
+        reg_stats.to_excel(writer, sheet_name='Regression_Stats')
+
+        # Sheet 6: Active Factor Exposures
+        afe_df = active_factor_exp.reset_index()
+        afe_df.columns = ['Factor', 'Active_Exposure']
+        afe_df.to_excel(writer, sheet_name='Active_Factor_Exposures', index=False)
+
+        # Sheet 7: Factor Covariance (monthly)
+        cov_monthly.to_excel(writer, sheet_name='Factor_Cov_Monthly')
+
+        # Sheet 8: Factor Covariance (annualized)
+        cov_annual = cov_monthly * ANNUALIZATION_FACTOR
+        cov_annual.to_excel(writer, sheet_name='Factor_Cov_Annual')
+
+        # Sheet 9: Factor Correlation
+        corr_df.to_excel(writer, sheet_name='Factor_Correlation')
+
+        # Sheet 10: Idiosyncratic Contributions
+        idio_annual = idio_contrib_monthly.loc[common_tickers] * ANNUALIZATION_FACTOR
+        idio_df = pd.DataFrame({
+            'Ticker': common_tickers,
+            'Active_Weight': active_weights.loc[common_tickers].values,
+            'Idio_Var_Annual': idio_annual.values,
+            'Idio_TE_bps': (np.sqrt(idio_annual) * 10000).values,
+        }).sort_values('Idio_Var_Annual', ascending=False)
+        idio_df.to_excel(writer, sheet_name='Idiosyncratic_Detail', index=False)
+
+    print(f"      Saved 11 sheets")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    # Step 1: Load data
+    (monthly_prices, port_weights, bench_weights,
+     factor_returns, fundamentals, universe) = load_module1_data(MODULE1_FILE)
+
+    # Step 2: Stock returns
+    stock_returns, available_tickers = compute_stock_returns(
+        monthly_prices, universe)
+
+    # Step 3: Active weights
+    active_weights = compute_active_weights(
+        port_weights, bench_weights, universe)
+
+    # Step 4: Factor regressions
+    beta_matrix, alpha_series, resid_var, r_squared, reg_stats = \
+        run_factor_regressions(stock_returns, factor_returns, available_tickers)
+
+    # Determine which factors were actually used
+    available_factors = beta_matrix.columns.tolist()
+
+    # Step 5: Active factor exposures
+    active_factor_exp, common_tickers = compute_active_factor_exposures(
+        beta_matrix, active_weights)
+
+    # Step 6: Factor covariance
+    cov_monthly, corr_df = compute_factor_covariance(
+        factor_returns, available_factors)
+
+    # Step 7: Idiosyncratic risk
+    total_idio_var_monthly, idio_contrib_monthly = compute_idiosyncratic_risk(
+        resid_var, active_weights, common_tickers)
+
+    # Step 7b: Security-level attribution
+    sec_attrib, total_te_check = compute_security_attribution(
+        beta_matrix, cov_monthly, resid_var, active_weights,
+        common_tickers, available_factors)
+
+    # Step 8: TE decomposition by factor
+    attribution, summary = decompose_tracking_error(
+        active_factor_exp, cov_monthly, total_idio_var_monthly,
+        available_factors)
+
+    # Save everything
+    save_results(attribution, summary, reg_stats, beta_matrix,
+                 active_weights, active_factor_exp, cov_monthly,
+                 corr_df, idio_contrib_monthly, common_tickers,
+                 sec_attrib)
+
+    print(f"\n{'=' * 70}")
+    print("MODULE 2 COMPLETE — Tracking error decomposed by factor")
+    print(f"{'=' * 70}")
+
+
+if __name__ == "__main__":
+    main()
