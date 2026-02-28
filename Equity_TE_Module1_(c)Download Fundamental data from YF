@@ -1,0 +1,435 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Feb 21 19:04:58 2026
+
+@author: amits
+"""
+
+# -*- coding: utf-8 -*-
+"""
+===============================================================================
+EQUITY TE ATTRIBUTION — MODULE 1 v5: EXISTING PRICES + YFINANCE FUNDAMENTALS
+===============================================================================
+
+Loads EXISTING monthly/daily price data from your saved Excel file.
+Downloads fundamentals via yfinance (free, no API key, full coverage).
+Merges everything + FF factors into final output Excel for Module 2.
+
+NO Twelve Data calls. NO FMP calls. Just yfinance (~45 sec).
+Install: pip install pandas numpy openpyxl yfinance
+===============================================================================
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# CONFIGURATION — UPDATE PATHS BEFORE RUNNING
+# =============================================================================
+
+# Your existing price data file (already downloaded from Twelve Data)
+PRICE_DATA_FILE = ((Monthly and daily ticker data.xlsx"))
+MONTHLY_SHEET = "85 month data"
+DAILY_SHEET = "90 day data"
+
+# Portfolio holdings file
+HOLDINGS_FILE = (Portfolio holdings.xlsx")
+PORTFOLIO_SHEET = "Holdings"
+BENCHMARK_SHEET = "Equity benchmark"
+TICKER_COLUMN = "Ticker"
+WEIGHT_COLUMN = "Weight"
+ASSET_CLASS_COLUMN = "Asset class"
+ASSET_CLASS_EQUITY = "Equity"
+
+# Fama-French factor file (local)
+# Fama-French factor file (local)
+FF5_FILE = (F-F_Research_Data_5_Factors_2x3_CSV (1)\F-F_Research_Data_5_Factors_2x3.csv")
+MOMENTUM_FILE = (F-F_Momentum_Factor_CSV (1)\F-F_Momentum_Factor.csv")  # Leave empty if Mom is already in FF5_FILE
+
+
+# Reference date
+REFERENCE_DATE = "2026-02-06"
+MONTHLY_LOOKBACK_MONTHS = 85
+
+# Output
+OUTPUT_FILE = "Equity_TE_Data.xlsx"
+
+# Vol factor ETFs (already in your price file)
+VOL_LONG_ETF = "SPLV"
+VOL_SHORT_ETF = "SPY"
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def to_float(val, default=np.nan):
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+# =============================================================================
+# STEP 1: LOAD TICKERS AND WEIGHTS
+# =============================================================================
+
+def load_tickers_and_weights():
+    print("\n[1/6] Loading tickers from holdings file...")
+
+    port_df = pd.read_excel(HOLDINGS_FILE, sheet_name=PORTFOLIO_SHEET)
+    port_weights = port_df[port_df[ASSET_CLASS_COLUMN] == ASSET_CLASS_EQUITY] \
+                      .set_index(TICKER_COLUMN)[WEIGHT_COLUMN]
+    port_weights = port_weights.groupby(level=0).sum()
+    print(f"      Portfolio: {len(port_weights)} equity tickers")
+
+    bench_df = pd.read_excel(HOLDINGS_FILE, sheet_name=BENCHMARK_SHEET)
+    bench_weights = bench_df.set_index(TICKER_COLUMN)[WEIGHT_COLUMN]
+    bench_weights = bench_weights.groupby(level=0).sum()
+    print(f"      Benchmark: {len(bench_weights)} tickers")
+
+    full_universe = sorted(set(port_weights.index.tolist() +
+                               bench_weights.index.tolist()))
+    print(f"      Full universe (union): {len(full_universe)} unique tickers")
+
+    return port_weights, bench_weights, full_universe
+
+
+# =============================================================================
+# STEP 2: LOAD EXISTING PRICE DATA (no API calls)
+# =============================================================================
+
+def load_existing_prices():
+    print(f"\n[2/6] Loading existing price data (no API calls)...")
+
+    monthly = pd.read_excel(PRICE_DATA_FILE, sheet_name=MONTHLY_SHEET)
+    monthly['Date'] = pd.to_datetime(monthly['Date'])
+    monthly.set_index('Date', inplace=True)
+    monthly.sort_index(inplace=True)
+    print(f"      Monthly: {monthly.shape[1]} tickers x {monthly.shape[0]} months")
+
+    daily = pd.read_excel(PRICE_DATA_FILE, sheet_name=DAILY_SHEET)
+    daily['Date'] = pd.to_datetime(daily['Date'])
+    daily.set_index('Date', inplace=True)
+    daily.sort_index(inplace=True)
+    print(f"      Daily:   {daily.shape[1]} tickers x {daily.shape[0]} days")
+
+    return monthly, daily
+
+
+# =============================================================================
+# STEP 3: DOWNLOAD FUNDAMENTALS VIA YFINANCE (free, full coverage)
+# =============================================================================
+
+def download_fundamentals(tickers):
+    """
+    yfinance provides:
+      ticker.info        → marketCap, beta, sector, industry, bookValue, sharesOutstanding
+      ticker.income_stmt → Total Revenue, Gross Profit, Operating Income, Net Income
+      ticker.balance_sheet → Total Assets (curr+prior), Stockholders Equity, Total Debt
+    """
+    print(f"\n[3/6] Downloading fundamentals — yfinance (free, no key)...")
+    print(f"      Tickers: {len(tickers)}")
+
+    results = []
+    errors = {}
+    
+    for i, ticker in enumerate(tickers, 1):
+        print(f"\r      [{i}/{len(tickers)}] {ticker:<8s}", end='', flush=True)
+
+        row = {"Ticker": ticker}
+
+        try:
+            yf_ticker = yf.Ticker(ticker)
+
+            # ---- ticker.info ----
+            try:
+                info = yf_ticker.info
+                row["market_capitalization"] = to_float(info.get("marketCap"))
+                row["beta"] = to_float(info.get("beta"))
+                row["price"] = to_float(info.get("currentPrice",
+                                                  info.get("regularMarketPrice")))
+                row["shares_outstanding"] = to_float(info.get("sharesOutstanding"))
+                row["book_value"] = to_float(info.get("bookValue"))
+                row["sector"] = info.get("sector", "")
+                row["industry"] = info.get("industry", "")
+                row["company_name"] = info.get("shortName",
+                                               info.get("longName", ""))
+                row["dividend_yield"] = to_float(info.get("dividendYield"))
+                row["trailing_pe"] = to_float(info.get("trailingPE"))
+                row["return_on_equity"] = to_float(info.get("returnOnEquity"))
+                row["return_on_assets"] = to_float(info.get("returnOnAssets"))
+            except Exception as e:
+                errors[ticker] = errors.get(ticker, "") + f"info: {e}; "
+
+            # ---- ticker.income_stmt ----
+            try:
+                inc = yf_ticker.income_stmt
+                if inc is not None and not inc.empty:
+                    row["income_fiscal_date"] = str(inc.columns[0].date()) \
+                        if hasattr(inc.columns[0], 'date') else str(inc.columns[0])
+                    for yf_field, our_field in [
+                        ("Total Revenue", "total_revenue"),
+                        ("Gross Profit", "gross_profit"),
+                        ("Operating Income", "operating_income"),
+                        ("Net Income", "net_income"),
+                        ("Cost Of Revenue", "cost_of_revenue"),
+                    ]:
+                        if yf_field in inc.index:
+                            row[our_field] = to_float(inc.loc[yf_field].iloc[0])
+                        else:
+                            row[our_field] = np.nan
+                else:
+                    errors[ticker] = errors.get(ticker, "") + "income_stmt: empty; "
+            except Exception as e:
+                errors[ticker] = errors.get(ticker, "") + f"income_stmt: {e}; "
+
+            # ---- ticker.balance_sheet (current + prior year for CMA) ----
+            try:
+                bs = yf_ticker.balance_sheet
+                if bs is not None and not bs.empty:
+                    row["bs_fiscal_date_current"] = str(bs.columns[0].date()) \
+                        if hasattr(bs.columns[0], 'date') else str(bs.columns[0])
+
+                    for yf_field, our_field in [
+                        ("Total Assets", "total_assets_current"),
+                        ("Total Liabilities Net Minority Interest", "total_liabilities"),
+                        ("Stockholders Equity", "total_stockholder_equity"),
+                        ("Total Debt", "total_debt"),
+                    ]:
+                        if yf_field in bs.index:
+                            row[our_field] = to_float(bs.loc[yf_field].iloc[0])
+                        else:
+                            row[our_field] = np.nan
+
+                    # Prior year for CMA (asset growth)
+                    if bs.shape[1] >= 2:
+                        row["bs_fiscal_date_prior"] = str(bs.columns[1].date()) \
+                            if hasattr(bs.columns[1], 'date') else str(bs.columns[1])
+                        if "Total Assets" in bs.index:
+                            row["total_assets_prior"] = to_float(
+                                bs.loc["Total Assets"].iloc[1])
+                        else:
+                            row["total_assets_prior"] = np.nan
+                    else:
+                        row["bs_fiscal_date_prior"] = ""
+                        row["total_assets_prior"] = np.nan
+                else:
+                    errors[ticker] = errors.get(ticker, "") + "balance_sheet: empty; "
+            except Exception as e:
+                errors[ticker] = errors.get(ticker, "") + f"balance_sheet: {e}; "
+
+            # Polite delay
+            time.sleep(1.5)
+
+        except Exception as e:
+            errors[ticker] = f"yfinance init failed: {e}"
+
+        results.append(row)
+
+    print(f"\n      Done: {len(results)}/{len(tickers)} tickers")
+
+    fundamentals_df = pd.DataFrame(results).set_index("Ticker")
+    return fundamentals_df, errors
+
+
+# =============================================================================
+# STEP 4-5: LOAD FAMA-FRENCH FACTORS + VOL FACTOR
+# =============================================================================
+
+def load_factors_and_vol(monthly_prices):
+    print(f"\n[4/6] Loading Fama-French factors...")
+
+    ref = pd.Timestamp(REFERENCE_DATE)
+    start = ref - pd.DateOffset(months=MONTHLY_LOOKBACK_MONTHS)
+
+    df_ff = pd.read_csv(FF5_FILE, index_col=0)
+    df_ff.index = pd.to_datetime(df_ff.index.astype(str).str.strip(), format='%Y%m')
+
+    ff_cols = [c for c in ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA', 'RF'] if c in df_ff.columns]
+    factor_df = df_ff[ff_cols].copy()
+
+    # Momentum
+    if 'Mom' in df_ff.columns:
+        factor_df['Mom'] = df_ff['Mom']
+        print(f"      Momentum found in FF5 file")
+    elif MOMENTUM_FILE and MOMENTUM_FILE.strip():
+        df_mom = pd.read_csv(MOMENTUM_FILE, index_col=0)
+        df_mom.index = pd.to_datetime(df_mom.index.astype(str).str.strip(), format='%Y%m')
+        for candidate in ['Mom', 'MOM', 'WML', 'UMD', 'Momentum']:
+            if candidate in df_mom.columns:
+                factor_df['Mom'] = df_mom[candidate]
+                break
+    else:
+        print(f"      WARNING: No momentum data. Set MOMENTUM_FILE.")
+
+    factor_df = factor_df / 100.0
+    factor_df = factor_df[(factor_df.index >= start) & (factor_df.index <= ref)]
+    factor_df.sort_index(inplace=True)
+    factor_df.index.name = 'Date'
+
+    print(f"      FF factors: {[c for c in factor_df.columns if c != 'RF']}")
+    print(f"      Observations: {len(factor_df)}")
+
+    # Vol factor from existing SPLV/SPY prices
+    print(f"\n[5/6] Computing vol factor from existing SPLV/SPY prices...")
+    if VOL_LONG_ETF in monthly_prices.columns and VOL_SHORT_ETF in monthly_prices.columns:
+        splv_ret = monthly_prices[VOL_LONG_ETF].pct_change().dropna()
+        spy_ret = monthly_prices[VOL_SHORT_ETF].pct_change().dropna()
+        common = splv_ret.index.intersection(spy_ret.index)
+        vol_factor = splv_ret.loc[common] - spy_ret.loc[common]
+        vol_factor = vol_factor[vol_factor.index >= start]
+        factor_df['Vol'] = vol_factor
+        factor_df.dropna(how='all', inplace=True)
+        print(f"      Vol factor: {len(vol_factor)} observations")
+    else:
+        print(f"      WARNING: SPLV or SPY not in price file. Skipping vol factor.")
+
+    print(f"      Final factors: {factor_df.columns.tolist()}")
+    return factor_df
+
+
+# =============================================================================
+# STEP 6: SAVE EVERYTHING
+# =============================================================================
+
+def save_to_excel(port_weights, bench_weights, monthly, daily,
+                  fundamentals, factor_returns, fund_errors):
+    print(f"\n[6/6] Saving to Excel: {OUTPUT_FILE}")
+
+    full_universe = sorted(set(port_weights.index.tolist() +
+                               bench_weights.index.tolist()))
+    log_rows = []
+    for ticker in full_universe:
+        row = {"Ticker": ticker}
+
+        if ticker in monthly.columns:
+            v = monthly[ticker].dropna()
+            row["Monthly_Months"] = len(v)
+        else:
+            row["Monthly_Months"] = 0
+
+        if ticker in daily.columns:
+            row["Daily_Days"] = len(daily[ticker].dropna())
+        else:
+            row["Daily_Days"] = 0
+
+        if ticker in fundamentals.index:
+            f = fundamentals.loc[ticker]
+            row["Has_MarketCap"] = "Yes" if pd.notna(f.get("market_capitalization")) else "No"
+            row["Has_Beta"] = "Yes" if pd.notna(f.get("beta")) else "No"
+            row["Has_GrossProfit"] = "Yes" if pd.notna(f.get("gross_profit")) else "No"
+            row["Has_TotalAssets_Curr"] = "Yes" if pd.notna(f.get("total_assets_current")) else "No"
+            row["Has_TotalAssets_Prior"] = "Yes" if pd.notna(f.get("total_assets_prior")) else "No"
+            row["Has_Equity"] = "Yes" if pd.notna(f.get("total_stockholder_equity")) else "No"
+            row["Beta_Source"] = "yfinance" if row["Has_Beta"] == "Yes" else "Not available"
+        else:
+            for fld in ["Has_MarketCap", "Has_Beta", "Has_GrossProfit",
+                        "Has_TotalAssets_Curr", "Has_TotalAssets_Prior", "Has_Equity"]:
+                row[fld] = "No"
+            row["Beta_Source"] = "Not available"
+
+        row["Errors"] = fund_errors.get(ticker, "")
+        log_rows.append(row)
+
+    data_log = pd.DataFrame(log_rows)
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+        config = pd.DataFrame({
+            'Parameter': ['Reference_Date', 'Monthly_Lookback', 'Universe_Size',
+                          'Factor_Count', 'Factors', 'Price_Source', 'Fundamental_Source'],
+            'Value': [REFERENCE_DATE, MONTHLY_LOOKBACK_MONTHS, len(full_universe),
+                      len(factor_returns.columns), ', '.join(factor_returns.columns.tolist()),
+                      'Twelve Data (pre-downloaded)', 'yfinance (free)']
+        })
+        config.to_excel(writer, sheet_name='Config', index=False)
+
+        pw = port_weights.reset_index(); pw.columns = ['Ticker', 'Weight']
+        pw.to_excel(writer, sheet_name='Portfolio_Weights', index=False)
+
+        bw = bench_weights.reset_index(); bw.columns = ['Ticker', 'Weight']
+        bw.to_excel(writer, sheet_name='Benchmark_Weights', index=False)
+
+        monthly.to_excel(writer, sheet_name='Monthly_Prices')
+        daily.to_excel(writer, sheet_name='Daily_Prices')
+        fundamentals.to_excel(writer, sheet_name='Fundamentals')
+        factor_returns.to_excel(writer, sheet_name='Factor_Returns')
+        data_log.to_excel(writer, sheet_name='Data_Log', index=False)
+
+    print(f"      Saved 8 sheets")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("EQUITY TE — MODULE 1 v5: EXISTING PRICES + YFINANCE")
+    print("=" * 70)
+    print(f"Prices:       Pre-downloaded (no API calls)")
+    print(f"Fundamentals: yfinance (free, no key)")
+    print(f"Reference:    {REFERENCE_DATE}")
+
+    # 1. Load tickers
+    port_weights, bench_weights, full_universe = load_tickers_and_weights()
+
+    # 2. Load existing prices
+    monthly, daily = load_existing_prices()
+
+    # 3. yfinance fundamentals
+    fund_tickers = [t for t in full_universe if t not in [VOL_LONG_ETF, VOL_SHORT_ETF]]
+    fundamentals, fund_errors = download_fundamentals(fund_tickers)
+
+    # 4-5. FF factors + vol factor
+    factor_returns = load_factors_and_vol(monthly)
+
+    # 6. Save
+    save_to_excel(port_weights, bench_weights, monthly, daily,
+                  fundamentals, factor_returns, fund_errors)
+
+    # Summary
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Portfolio:     {len(port_weights)} tickers")
+    print(f"  Benchmark:     {len(bench_weights)} tickers")
+    print(f"  Universe:      {len(full_universe)} tickers")
+    print(f"  Monthly:       {monthly.shape[1]} tickers x {monthly.shape[0]} months")
+    print(f"  Daily:         {daily.shape[1]} tickers x {daily.shape[0]} days")
+    print(f"  Fundamentals:  {len(fundamentals)} tickers (yfinance)")
+
+    if 'market_capitalization' in fundamentals.columns:
+        has_mc = fundamentals['market_capitalization'].notna().sum()
+        print(f"  Market cap:    {has_mc}/{len(fundamentals)}")
+    if 'beta' in fundamentals.columns:
+        has_beta = fundamentals['beta'].notna().sum()
+        print(f"  Beta:          {has_beta}/{len(fundamentals)}")
+    if 'gross_profit' in fundamentals.columns:
+        has_gp = fundamentals['gross_profit'].notna().sum()
+        print(f"  Gross profit:  {has_gp}/{len(fundamentals)}")
+    if 'total_assets_current' in fundamentals.columns:
+        has_ta = fundamentals['total_assets_current'].notna().sum()
+        print(f"  Total assets:  {has_ta}/{len(fundamentals)}")
+
+    print(f"  Factors:       {len(factor_returns.columns)} x {len(factor_returns)} months")
+
+    if fund_errors:
+        print(f"\n  Partial errors ({len(fund_errors)} tickers):")
+        for t, e in fund_errors.items():
+            print(f"    {t}: {e}")
+
+    print(f"\n  Output: {OUTPUT_FILE}")
+    print(f"\n{'='*70}")
+    print("MODULE 1 COMPLETE — Ready for Module 2")
+    print(f"{'='*70}")
+
+
+if __name__ == "__main__":
+    main()
